@@ -1,0 +1,37 @@
+{
+  "version": 2,
+  "skills": {
+    "computer-vision-opencv": {
+      "source": "Mindrally/skills",
+      "commit": "7682ca77710e0971eab4e0ae5dddfa281aea0ba5",
+      "sourceType": "github",
+      "skillPath": "computer-vision-opencv/SKILL.md",
+      "computedHash": "91752d0ea85cca91c07e09bdc2f0c2a814779e01e0f6cd817c6ae3a072ed725f",
+      "installMode": "copy"
+    },
+    "huggingface-local-models": {
+      "source": "huggingface/skills",
+      "commit": "5291c2b9365e06b175dc04817610c778623f4836",
+      "sourceType": "github",
+      "skillPath": "skills/huggingface-local-models/SKILL.md",
+      "computedHash": "0ccd1cccf40e3e5dff47ceb65a88817993416afdf86dc5ffb97101950ab558f5",
+      "installMode": "copy"
+    },
+    "image-processing": {
+      "source": "jezweb/claude-skills",
+      "commit": "1260fa7439b36b18dbf16648ccc7fb44783f6c23",
+      "sourceType": "github",
+      "skillPath": "plugins/design-assets/skills/image-processing/SKILL.md",
+      "computedHash": "7065677fbd9ccaead5944f930403535340c5642b0e4533f7bd22b91d953eb61e",
+      "installMode": "copy"
+    },
+    "pytorch-patterns": {
+      "source": "affaan-m/ECC",
+      "commit": "4adeee6732a12d1540f49a4d50a38ce8c97f9a53",
+      "sourceType": "github",
+      "skillPath": "skills/pytorch-patterns/SKILL.md",
+      "computedHash": "27f10c0703d3673e050b2200d12aafdc1542352a13d5a2ba6511a7fd31e370fd",
+      "installMode": "copy"
+    }
+  }
+}

@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.python-version
+
+# Keep skills-lock.json tracked; ignore any local skill caches outside .agents/
+.skills-cache/
+
+# Experiment artifacts
+code/**/output/
+code/**/weights/
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.safetensors
+*.h5
+*.pkl
+
+# IDE / OS
+.DS_Store
+.idea/
+*.swp
+
+# Skills lock noise (keep skills-lock.json if present for restore)
+node_modules/
+
+sources/**
+**/.DS_Store

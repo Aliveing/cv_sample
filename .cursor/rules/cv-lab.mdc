@@ -1,0 +1,23 @@
+---
+description: cv_sample lab conventions — algorithms, models, effects experiments
+alwaysApply: true
+---
+
+# cv_sample Lab Rule
+
+Python image-processing lab for verifying/developing **algorithms**, **models**, and visual **effects**.
+
+## Layout
+
+- `sources/` — input images only (never overwrite)
+- `code/<experiment>/` — one folder per experiment; scripts live here
+- `code/<experiment>/output/` — generated results
+- `code/<experiment>/weights/` — model checkpoints (do not commit large binaries)
+
+## Agent behavior
+
+1. Read `.cursor/skills/cv-sample-lab/SKILL.md` before adding experiments.
+2. For classical CV → also use `computer-vision-opencv` / `image-processing` skills.
+3. For Torch / local HF models → use `pytorch-patterns` / `huggingface-local-models`.
+4. Prefer Context7 MCP for up-to-date OpenCV / PyTorch / Transformers API docs.
+5. New work always gets a new `code/<name>/` folder; keep scripts runnable with plain `python`.

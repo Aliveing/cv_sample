@@ -1,0 +1,13 @@
+# Core CV lab stack — install: pip install -r requirements.txt
+opencv-python>=4.8
+numpy>=1.24
+Pillow>=10.0
+matplotlib>=3.7
+scikit-image>=0.22
+
+# Optional model stack — uncomment when an experiment needs them
+# torch
+# torchvision
+# onnxruntime
+# transformers
+# huggingface-hub
