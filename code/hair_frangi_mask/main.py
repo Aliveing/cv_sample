@@ -23,7 +23,7 @@ VESSEL_PERCENTILE = 90.0  # floor=0 后百分位才真正生效；50 会半图�
 LOCAL_NORM_FLOOR = 0.0
 # 补梢策略（Meijering/Sato+分尺度 OR 噪大、精度不如纯 Frangi → 默认 off）:
 #   "off" | "tangent" | "meijering_sato" | "per_scale" | "both"
-TIP_MODE = "per_scale"  # 方案3：分尺度阈值再 OR（纯 Frangi，不加 Meijering/Sato）
+TIP_MODE = "tangent"  # 方案3：分尺度阈值再 OR（纯 Frangi，不加 Meijering/Sato）
 # 方式2：Meijering / Sato 与 Frangi 取 max（管端更温和，易噪）
 # 方式3：小 σ / 大 σ 分百分位阈值后再 OR（易噪）
 PER_SCALE_FINE_MAX = 2.0  # σ ≤ 此值用细尺度百分位
@@ -40,9 +40,16 @@ TANGENT_HARD_BORDER = 2
 TANGENT_SOFT_BORDER = 14
 TANGENT_EDGE_ALIGN = 0.75
 TANGENT_ONLY_ENDPOINTS = True
-CLOSE_KSIZE = 0  # 0 = skip close (03f → 04 不做膨胀腐蚀)
+CLOSE_KSIZE = 3  # bridge 1–2px Frangi pinch-offs at crossings
 OPEN_KSIZE = 0
 MIN_OBJECT_PX = 0  # 0 = skip remove_small_objects
+
+# Black-hat parallel path: dark lines without tubular (junction) suppression
+USE_TOPHAT_BRIDGE = True
+TOPHAT_KSIZE = 7  # ellipse; ~hair width + margin
+TOPHAT_PERCENTILE = 94.0  # stricter than Frangi — only strong dark strokes
+TOPHAT_FLOOR = 4.0  # absolute blackhat floor (0–255)
+TOPHAT_NEAR_PX = 5  # 0 = global; >0 only keep tophat within dilate(Frangi)
 
 # Vellus: finer scales, looser gate (also bright-ridge pass for lit fuzz)
 SIGMAS_VELLUS = (0.6, 0.9, 1.2)
@@ -540,6 +547,33 @@ def _threshold(
     return binary
 
 
+def _tophat_dark_mask(
+    luma: np.ndarray,
+    roi: np.ndarray,
+    weight: np.ndarray,
+    spec: np.ndarray,
+    *,
+    ksize: int,
+    percentile: float,
+    floor: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Black-hat dark strokes (no tubular prior → crossings stay bright)."""
+    k = max(3, ksize | 1)
+    u8 = np.clip(luma, 0, 255).astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    bh = cv2.morphologyEx(u8, cv2.MORPH_BLACKHAT, kernel).astype(np.float32)
+    damp = _border_damp(roi)
+    scored = np.where(roi, bh * weight * damp, 0.0)
+    scored = np.where(spec, 0.0, scored)
+    eligible = roi & (weight > 0) & ~spec
+    vals = scored[eligible]
+    if vals.size == 0:
+        return bh, np.zeros(roi.shape, dtype=bool)
+    thr = max(float(np.percentile(vals, percentile)), float(floor))
+    binary = (scored >= thr) & eligible
+    return scored, binary
+
+
 def _morph(
     binary: np.ndarray,
     *,
@@ -660,7 +694,7 @@ def _branch(
     min_object_px: int,
     bright_ridges: bool = False,
     save_tip_debug: bool = False,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     mode = TIP_MODE
     use_ms = mode in ("meijering_sato", "both")
     use_ps = mode in ("per_scale", "both")
@@ -752,6 +786,44 @@ def _branch(
             f"thresh_add={int(added.sum())} thresh_lost={int(lost.sum())}"
         )
 
+    # Bridge Frangi junction dropouts with black-hat dark lines
+    thresh_frangi = thresh.copy()
+    tophat_added = np.zeros(roi.shape, dtype=bool)
+    if USE_TOPHAT_BRIDGE:
+        bh, th_bin = _tophat_dark_mask(
+            luma,
+            roi,
+            weight,
+            spec,
+            ksize=TOPHAT_KSIZE,
+            percentile=TOPHAT_PERCENTILE,
+            floor=TOPHAT_FLOOR,
+        )
+        if TOPHAT_NEAR_PX > 0:
+            k = max(3, int(TOPHAT_NEAR_PX) * 2 + 1)
+            near = cv2.dilate(
+                thresh_frangi.astype(np.uint8) * 255,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)),
+            ) > 0
+            th_bin = th_bin & near
+        tophat_added = th_bin & ~thresh_frangi & roi
+        thresh = thresh_frangi | th_bin
+        if save_tip_debug:
+            cv2.imwrite(str(OUT / "02e_tophat.png"), _to_u8(bh, roi))
+            cv2.imwrite(
+                str(OUT / "02f_tophat_binary.png"),
+                (th_bin.astype(np.uint8) * 255),
+            )
+            cv2.imwrite(
+                str(OUT / "02g_tophat_added.png"),
+                (tophat_added.astype(np.uint8) * 255),
+            )
+            print(
+                f"tophat bridge: k={TOPHAT_KSIZE} pct={TOPHAT_PERCENTILE} "
+                f"near={TOPHAT_NEAR_PX} add_px={int(tophat_added.sum())} "
+                f"union={int(thresh.sum())}"
+            )
+
     mask = _morph(
         thresh,
         close_ksize=close_ksize,
@@ -761,7 +833,7 @@ def _branch(
     if ELONGATE_FILTER:
         mask = _filter_elongated(mask)
     mask &= roi
-    return vessel, thresh, mask
+    return vessel, thresh, mask, tophat_added
 
 
 def main() -> None:
@@ -788,7 +860,7 @@ def main() -> None:
     else:
         spec = _specular_mask(bgr)
 
-    vessel_c, thresh_c, mask_c = _branch(
+    vessel_c, thresh_c, mask_c, tophat_c = _branch(
         frangi_in,
         roi,
         weight,
@@ -812,7 +884,7 @@ def main() -> None:
     )
 
     if INCLUDE_VELLUS:
-        vessel_v, thresh_v, mask_v = _branch(
+        vessel_v, thresh_v, mask_v, _tophat_v = _branch(
             frangi_in,
             roi,
             weight,
@@ -848,15 +920,24 @@ def main() -> None:
     cv2.imwrite(str(OUT / "04_mask.png"), (mask.astype(np.uint8) * 255))
     cv2.imwrite(str(OUT / "04b_mask_coarse.png"), (mask_c.astype(np.uint8) * 255))
     cv2.imwrite(str(OUT / "04c_mask_vellus.png"), (mask_v.astype(np.uint8) * 255))
-    cv2.imwrite(str(OUT / "05_overlay.png"), _overlay(bgr, mask_c, mask_v, roi))
+    overlay = _overlay(bgr, mask_c, mask_v, roi)
+    cv2.imwrite(str(OUT / "05_overlay.png"), overlay)
+    # Cyan = survived tophat pixels that Frangi thresh missed (crossing bridge cue)
+    if np.any(tophat_c):
+        bridge_vis = overlay.copy()
+        kept_bridge = tophat_c & mask_c & roi
+        bridge_vis[kept_bridge] = (255, 255, 0)  # cyan in BGR
+        cv2.imwrite(str(OUT / "05b_tophat_bridge_overlay.png"), bridge_vis)
 
     print(f"input:  {rgba_path.relative_to(ROOT)}")
     print(f"output: {OUT.relative_to(ROOT)}")
     print(
         f"prep={PREP_MODE} tip={TIP_MODE} skin_w={USE_SKIN_WEIGHT} "
-        f"elong={ELONGATE_FILTER} pct={VESSEL_PERCENTILE} vellus={INCLUDE_VELLUS} "
-        f"raw={int(raw_union.sum())} coarse={int(mask_c.sum())} "
-        f"vellus_px={int(mask_v.sum())} union={int(mask.sum())}"
+        f"elong={ELONGATE_FILTER} close={CLOSE_KSIZE} "
+        f"tophat={USE_TOPHAT_BRIDGE} pct={VESSEL_PERCENTILE} "
+        f"vellus={INCLUDE_VELLUS} raw={int(raw_union.sum())} "
+        f"coarse={int(mask_c.sum())} vellus_px={int(mask_v.sum())} "
+        f"union={int(mask.sum())} tophat_kept={int((tophat_c & mask_c).sum())}"
     )
 
 
