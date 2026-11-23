@@ -6,7 +6,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from skimage.filters import frangi
+from skimage.feature import hessian_matrix
+from skimage.filters import frangi, meijering, sato
 from skimage.morphology import remove_small_objects
 
 # --- tune here ---
@@ -20,6 +21,25 @@ RESIDUAL_GAIN = 2.5  # darken hair vs skin estimate
 SIGMAS = (0.8, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.5, 5.0, 6.5, 8.0, 10.0)
 VESSEL_PERCENTILE = 90.0  # floor=0 后百分位才真正生效；50 会半图糊满
 LOCAL_NORM_FLOOR = 0.0
+# 补梢策略（Meijering/Sato+分尺度 OR 噪大、精度不如纯 Frangi → 默认 off）:
+#   "off" | "tangent" | "meijering_sato" | "per_scale" | "both"
+TIP_MODE = "per_scale"  # 方案3：分尺度阈值再 OR（纯 Frangi，不加 Meijering/Sato）
+# 方式2：Meijering / Sato 与 Frangi 取 max（管端更温和，易噪）
+# 方式3：小 σ / 大 σ 分百分位阈值后再 OR（易噪）
+PER_SCALE_FINE_MAX = 2.0  # σ ≤ 此值用细尺度百分位
+PER_SCALE_FINE_PCT = 90.0  # 与主阈值对齐，避免细 σ 灌噪声
+PER_SCALE_COARSE_PCT = 92.0
+# 方式1（保留开关，默认关）
+TANGENT_TIP_EXTEND = False  # 仅 TIP_MODE=="tangent" 时走
+TANGENT_SIGMA = 1.5
+TANGENT_SEED_PCT = 90.0
+TANGENT_MAX_STEPS = 20
+TANGENT_DARK_MARGIN = 2.5
+TANGENT_MIN_VESSEL = 0.75
+TANGENT_HARD_BORDER = 2
+TANGENT_SOFT_BORDER = 14
+TANGENT_EDGE_ALIGN = 0.75
+TANGENT_ONLY_ENDPOINTS = True
 CLOSE_KSIZE = 0  # 0 = skip close (03f → 04 不做膨胀腐蚀)
 OPEN_KSIZE = 0
 MIN_OBJECT_PX = 0  # 0 = skip remove_small_objects
@@ -32,7 +52,11 @@ CLOSE_KSIZE_VELLUS = 3
 MIN_OBJECT_PX_VELLUS = 8
 VELLUS_BRIGHT_RIDGES = True  # catch highlight peach-fuzz
 
-LOCAL_NORM_KSIZE = 101
+LOCAL_NORM_KSIZE = 31  # 原 101：核太大 → 线旁弱尾被抬满成光晕
+LOCAL_NORM_POWER = 1.35  # >1 压中灰，减轻泛白光晕
+# 压 ROI 黑边假脊：外面填边缘中值再跑 Hessian；scored 再按距边衰减
+ROI_EDGE_FILL = True
+BORDER_DAMP_PX = 14  # dist < 此 → 线性压到 0（贴轮廓假脊）
 SPECULAR_Y = 220
 SPECULAR_S_MAX = 40
 SKIN_CR = (133, 173)
@@ -44,8 +68,11 @@ SKIN_Y_MEDIAN_GATE = True
 # 细长连通域过滤（用二阶矩，避免斜向细丝被 AABB 误杀）
 ELONGATE_FILTER = True
 ELONG_MIN_AREA = 4
-ELONG_MIN_ASPECT = 3.0  # λ_max/λ_min（矩特征值比）；越大越严
+ELONG_MIN_ASPECT = 2.5  # λ_max/λ_min；成簇弯曲发会把 ratio 压低，略放宽
 ELONG_MIN_MAJOR = 6  # 近似主轴长度（px）下限
+# 大块发丝/发簇：aspect 不够细长也保留（04a→04b 曾误杀角上明显大毛）
+ELONG_KEEP_AREA = 120
+ELONG_KEEP_MAJOR = 24
 CLAHE_CLIP = 2.0
 CLAHE_GRID = (8, 8)
 
@@ -176,7 +203,32 @@ def _prepare_frangi_input(bgr: np.ndarray, roi: np.ndarray) -> np.ndarray:
     if np.any(spec & roi):
         blurred = cv2.GaussianBlur(prep_eq, (0, 0), 2.0)
         prep_eq = np.where(spec, blurred, prep_eq)
-    return np.where(roi, prep_eq, 0.0)
+    prep_eq = np.where(roi, prep_eq, 0.0)
+    if ROI_EDGE_FILL:
+        prep_eq = _fill_outside_roi(prep_eq, roi)
+    return prep_eq
+
+
+def _fill_outside_roi(prep: np.ndarray, roi: np.ndarray) -> np.ndarray:
+    """Replace black outside with ROI-edge median so Hessian doesn't see a hard step."""
+    if not np.any(roi):
+        return prep
+    dist = cv2.distanceTransform(roi.astype(np.uint8), cv2.DIST_L2, 5)
+    ring = roi & (dist <= 3.0)
+    if not np.any(ring):
+        ring = roi
+    fill = float(np.median(prep[ring]))
+    out = prep.copy()
+    out[~roi] = fill
+    return out
+
+
+def _border_damp(roi: np.ndarray) -> np.ndarray:
+    """0 at silhouette → 1 by BORDER_DAMP_PX inside."""
+    if BORDER_DAMP_PX <= 0:
+        return np.where(roi, 1.0, 0.0).astype(np.float32)
+    dist = cv2.distanceTransform(roi.astype(np.uint8), cv2.DIST_L2, 5)
+    return np.clip(dist / float(BORDER_DAMP_PX), 0.0, 1.0).astype(np.float32)
 
 
 def _vesselness(
@@ -191,12 +243,243 @@ def _vesselness(
     return np.where(roi, v, 0.0).astype(np.float32)
 
 
+def _norm_roi(v: np.ndarray, roi: np.ndarray) -> np.ndarray:
+    """Scale ROI values to [0,1] so different ridge filters are comparable."""
+    out = np.zeros(v.shape, dtype=np.float32)
+    if not np.any(roi):
+        return out
+    vals = v[roi]
+    mx = float(vals.max())
+    if mx <= 1e-12:
+        return out
+    out[roi] = (vals / mx).astype(np.float32)
+    return out
+
+
+def _ridge_stack(
+    luma: np.ndarray,
+    roi: np.ndarray,
+    sigmas: tuple[float, ...],
+    *,
+    black_ridges: bool = True,
+    use_meijering_sato: bool = False,
+) -> np.ndarray:
+    """Frangi (+ optional Meijering/Sato max). Each filter ROI-normalized first."""
+    img = (luma / 255.0).astype(np.float64)
+    stack = [_norm_roi(
+        np.where(roi, frangi(img, sigmas=sigmas, black_ridges=black_ridges), 0.0).astype(
+            np.float32
+        ),
+        roi,
+    )]
+    if use_meijering_sato:
+        stack.append(
+            _norm_roi(
+                np.where(
+                    roi,
+                    meijering(img, sigmas=sigmas, black_ridges=black_ridges),
+                    0.0,
+                ).astype(np.float32),
+                roi,
+            )
+        )
+        stack.append(
+            _norm_roi(
+                np.where(
+                    roi, sato(img, sigmas=sigmas, black_ridges=black_ridges), 0.0
+                ).astype(np.float32),
+                roi,
+            )
+        )
+    out = stack[0]
+    for s in stack[1:]:
+        out = np.maximum(out, s)
+    return out
+
+
+def _per_scale_thresh(
+    luma: np.ndarray,
+    roi: np.ndarray,
+    weight: np.ndarray,
+    spec: np.ndarray,
+    sigmas: tuple[float, ...],
+    *,
+    use_meijering_sato: bool,
+    floor: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Threshold each σ alone (fine→lower pct), OR masks; vessel = max response."""
+    vessel_max = np.zeros(roi.shape, dtype=np.float32)
+    mask_or = np.zeros(roi.shape, dtype=bool)
+    fine_n = coarse_n = 0
+    for sigma in sigmas:
+        v = _ridge_stack(
+            luma,
+            roi,
+            (float(sigma),),
+            black_ridges=True,
+            use_meijering_sato=use_meijering_sato,
+        )
+        v = np.where(spec, 0.0, v)
+        vessel_max = np.maximum(vessel_max, v)
+        pct = (
+            PER_SCALE_FINE_PCT
+            if float(sigma) <= PER_SCALE_FINE_MAX
+            else PER_SCALE_COARSE_PCT
+        )
+        if float(sigma) <= PER_SCALE_FINE_MAX:
+            fine_n += 1
+        else:
+            coarse_n += 1
+        mask_or |= _threshold(v, roi, weight, percentile=pct, floor=floor)
+    print(
+        f"per_scale: sigmas={len(sigmas)} fine(≤{PER_SCALE_FINE_MAX})={fine_n} "
+        f"@{PER_SCALE_FINE_PCT} coarse={coarse_n} @{PER_SCALE_COARSE_PCT} "
+        f"or_px={int(mask_or.sum())}"
+    )
+    return vessel_max, mask_or
+
+
+def _ridge_tangent_field(luma: np.ndarray, sigma: float) -> tuple[np.ndarray, np.ndarray]:
+    """Unit tangent along dark ridge = eigenvector of smaller |Hessian eigenvalue|."""
+    img = (luma / 255.0).astype(np.float64)
+    # order='rc' → (Hrr, Hrc, Hcc); row=y, col=x
+    Hrr, Hrc, Hcc = hessian_matrix(
+        img, sigma=sigma, order="rc", use_gaussian_derivatives=True
+    )
+    a, b, c = Hrr, Hrc, Hcc
+    disc = np.sqrt(np.maximum((a - c) ** 2 + 4.0 * b * b, 0.0))
+    # eigenvalues; ridge direction ↔ eigenvalue closer to 0
+    l1 = 0.5 * (a + c + disc)
+    l2 = 0.5 * (a + c - disc)
+    use_l2 = np.abs(l2) <= np.abs(l1)
+    lam = np.where(use_l2, l2, l1)
+    # eigenvector for λ: (b, λ-a); fallback (λ-c, b)
+    vx = np.where(np.abs(b) > 1e-12, b, lam - c)
+    vy = np.where(np.abs(b) > 1e-12, lam - a, b)
+    n = np.hypot(vx, vy)
+    n = np.maximum(n, 1e-12)
+    # skimage rc: vy along rows, vx along cols
+    return (vx / n).astype(np.float32), (vy / n).astype(np.float32)
+
+
+def _extend_tips_along_tangent(
+    vessel: np.ndarray,
+    luma: np.ndarray,
+    roi: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Walk tangent from ridge endpoints; return (boosted_vessel, lift_mask)."""
+    lift_mask = np.zeros(vessel.shape, dtype=bool)
+    if not np.any(roi):
+        return vessel, lift_mask
+
+    vx, vy = _ridge_tangent_field(luma, TANGENT_SIGMA)
+    local_mean = cv2.GaussianBlur(luma, (0, 0), 3.0)
+
+    dist = cv2.distanceTransform(roi.astype(np.uint8), cv2.DIST_L2, 5)
+    gy, gx = np.gradient(dist.astype(np.float32))
+    gn = np.maximum(np.hypot(gx, gy), 1e-6)
+    etx = (-gy / gn).astype(np.float32)
+    ety = (gx / gn).astype(np.float32)
+
+    vals = vessel[roi]
+    seed_thr = max(float(np.percentile(vals, TANGENT_SEED_PCT)), 1e-8)
+    # allow seeds near hairline; only exclude 2px hard border
+    strong = (vessel >= seed_thr) & roi & (dist >= float(TANGENT_HARD_BORDER))
+    ys, xs = np.where(strong)
+    if ys.size == 0:
+        return vessel, lift_mask
+
+    walks: list[tuple[int, int, float]] = []
+    for y0, x0 in zip(ys.tolist(), xs.tolist()):
+        tx, ty = float(vx[y0, x0]), float(vy[y0, x0])
+        tn = max(np.hypot(tx, ty), 1e-12)
+        tx, ty = tx / tn, ty / tn
+        for sign in (-1.0, 1.0):
+            xi = int(round(x0 + sign * tx))
+            yi = int(round(y0 + sign * ty))
+            if not (0 <= xi < vessel.shape[1] and 0 <= yi < vessel.shape[0] and roi[yi, xi]):
+                ahead_weak = True
+            else:
+                ahead_weak = float(vessel[yi, xi]) < seed_thr * 0.5
+            if TANGENT_ONLY_ENDPOINTS and not ahead_weak:
+                continue
+            walks.append((y0, x0, sign))
+
+    if len(walks) > 16000:
+        rng = np.random.default_rng(0)
+        idx = rng.choice(len(walks), size=16000, replace=False)
+        walks = [walks[i] for i in idx]
+
+    out = vessel.copy()
+    h, w = vessel.shape
+    lifted = 0
+    stopped_edge = 0
+
+    for y0, x0, sign in walks:
+        x, y = float(x0), float(y0)
+        dx = float(vx[y0, x0]) * sign
+        dy = float(vy[y0, x0]) * sign
+        sn = max(np.hypot(dx, dy), 1e-12)
+        dx, dy = dx / sn, dy / sn
+        seed_v = float(vessel[y0, x0])
+        for _ in range(TANGENT_MAX_STEPS):
+            x += dx
+            y += dy
+            xi, yi = int(round(x)), int(round(y))
+            if xi < 0 or yi < 0 or xi >= w or yi >= h or not roi[yi, xi]:
+                break
+            d = float(dist[yi, xi])
+            if d < float(TANGENT_HARD_BORDER):
+                stopped_edge += 1
+                break
+            # soft border: only block silhouette-parallel walks
+            if d < float(TANGENT_SOFT_BORDER):
+                if abs(dx * float(etx[yi, xi]) + dy * float(ety[yi, xi])) >= TANGENT_EDGE_ALIGN:
+                    stopped_edge += 1
+                    break
+            if float(luma[yi, xi]) > float(local_mean[yi, xi]) - TANGENT_DARK_MARGIN:
+                break
+
+            ndx, ndy = float(vx[yi, xi]), float(vy[yi, xi])
+            dot = ndx * dx + ndy * dy
+            if abs(dot) < 0.5:
+                ndx, ndy = -ndx, -ndy
+                dot = ndx * dx + ndy * dy
+                if abs(dot) < 0.5:
+                    break
+            dx = 0.65 * dx + 0.35 * ndx * np.sign(dot + 1e-12)
+            dy = 0.65 * dy + 0.35 * ndy * np.sign(dot + 1e-12)
+            sn = max(np.hypot(dx, dy), 1e-12)
+            dx, dy = dx / sn, dy / sn
+
+            target = seed_v * TANGENT_MIN_VESSEL
+            if out[yi, xi] < target:
+                out[yi, xi] = target
+                lift_mask[yi, xi] = True
+                lifted += 1
+
+    print(
+        f"tangent tip extend: walks={len(walks)} lifts={lifted} "
+        f"edge_stops={stopped_edge} hard={TANGENT_HARD_BORDER} soft={TANGENT_SOFT_BORDER}"
+    )
+    return out, lift_mask
+
+
 def _local_normalize(v: np.ndarray, roi: np.ndarray) -> np.ndarray:
     k = LOCAL_NORM_KSIZE | 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    local_max = cv2.dilate(v, kernel)
+    # outside→copy nearest ROI max so dilate near border isn't crushed by zeros
+    v_fill = v.copy()
+    if np.any(roi):
+        # seed outside with local dilate of ROI-only values (zeros outside first)
+        v_roi = np.where(roi, v, 0.0).astype(np.float32)
+        local_max0 = cv2.dilate(v_roi, kernel)
+        v_fill = np.where(roi, v, local_max0)
+    local_max = cv2.dilate(v_fill.astype(np.float32), kernel)
     local_max = np.maximum(local_max, 1e-6)
     norm = v / local_max
+    if LOCAL_NORM_POWER != 1.0:
+        norm = np.power(np.clip(norm, 0.0, 1.0), LOCAL_NORM_POWER)
     return np.where(roi, norm.astype(np.float32), 0.0)
 
 
@@ -211,7 +494,8 @@ def _threshold(
 ) -> np.ndarray:
     """Binary threshold. If debug_prefix set, write each sub-step under OUT/."""
     local_norm = _local_normalize(v, roi)
-    weighted = local_norm * weight
+    damp = _border_damp(roi)
+    weighted = local_norm * weight * damp
     scored = np.where(roi, weighted, 0.0)
     # 百分位只在未硬切掉的像素上算，避免大量 0 把 thr 拉崩
     eligible = roi & (weight > 0)
@@ -289,12 +573,15 @@ def _filter_elongated(binary: np.ndarray) -> np.ndarray:
     """Keep thin/long CCs via central-moment eigenvalues (rotation-invariant).
 
     AABB aspect fails on diagonal strands (box looks square). Moment ratio
-    λ_max/λ_min stays high for thin lines at any angle.
+    λ_max/λ_min stays high for thin lines at any angle. Large clumps/curves
+    can have low aspect — also keep if area+major clear the keep-* gates.
     """
     u8 = binary.astype(np.uint8)
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(u8, connectivity=8)
     keep = np.zeros(binary.shape, dtype=bool)
+    killed = np.zeros(binary.shape, dtype=bool)
     kept = 0
+    kept_large = 0
     for i in range(1, n_labels):
         area = int(stats[i, cv2.CC_STAT_AREA])
         if area < ELONG_MIN_AREA:
@@ -313,13 +600,20 @@ def _filter_elongated(binary: np.ndarray) -> np.ndarray:
         aspect = lam_max / max(lam_min, 1e-12)
         # major ≈ 4*sqrt(lam_max) for a thin line segment scale
         major = 4.0 * np.sqrt(max(lam_max, 0.0))
-        if major >= ELONG_MIN_MAJOR and aspect >= ELONG_MIN_ASPECT:
+        elongated = major >= ELONG_MIN_MAJOR and aspect >= ELONG_MIN_ASPECT
+        large = area >= ELONG_KEEP_AREA and major >= ELONG_KEEP_MAJOR
+        if elongated or large:
             keep[comp.astype(bool)] = True
             kept += 1
+            if large and not elongated:
+                kept_large += 1
+        else:
+            killed[comp.astype(bool)] = True
     print(
         f"elongate filter(moments): comps={n_labels - 1} kept={kept} "
-        f"px {int(binary.sum())}→{int(keep.sum())}"
+        f"(via_large={kept_large}) px {int(binary.sum())}→{int(keep.sum())}"
     )
+    cv2.imwrite(str(OUT / "04d_elong_killed.png"), (killed.astype(np.uint8) * 255))
     return keep
 
 
@@ -365,22 +659,99 @@ def _branch(
     open_ksize: int,
     min_object_px: int,
     bright_ridges: bool = False,
+    save_tip_debug: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    # PS selective-color+B&W here is bright skin + dark hair → black_ridges
-    vessel = _vesselness(luma, roi, sigmas, black_ridges=True)
+    mode = TIP_MODE
+    use_ms = mode in ("meijering_sato", "both")
+    use_ps = mode in ("per_scale", "both")
+    use_tangent = mode == "tangent" or (mode == "off" and TANGENT_TIP_EXTEND)
+
+    # Frangi-only baseline for debug delta
+    frangi_only = _vesselness(luma, roi, sigmas, black_ridges=True)
     if bright_ridges:
-        vessel = np.maximum(
-            vessel, _vesselness(luma, roi, sigmas, black_ridges=False)
+        frangi_only = np.maximum(
+            frangi_only, _vesselness(luma, roi, sigmas, black_ridges=False)
         )
-    vessel = np.where(spec, 0.0, vessel)
-    thresh = _threshold(
-        vessel,
-        roi,
-        weight,
-        percentile=percentile,
-        floor=floor,
-        debug_prefix=None,
-    )
+    frangi_only = np.where(spec, 0.0, frangi_only)
+
+    if use_ps:
+        vessel, thresh = _per_scale_thresh(
+            luma,
+            roi,
+            weight,
+            spec,
+            sigmas,
+            use_meijering_sato=use_ms,
+            floor=floor,
+        )
+        if bright_ridges:
+            v_bright = _ridge_stack(
+                luma, roi, sigmas, black_ridges=False, use_meijering_sato=use_ms
+            )
+            v_bright = np.where(spec, 0.0, v_bright)
+            vessel = np.maximum(vessel, v_bright)
+            thresh = thresh | _threshold(
+                v_bright, roi, weight, percentile=percentile, floor=floor
+            )
+    else:
+        vessel = _ridge_stack(
+            luma,
+            roi,
+            sigmas,
+            black_ridges=True,
+            use_meijering_sato=use_ms,
+        )
+        if bright_ridges:
+            vessel = np.maximum(
+                vessel,
+                _ridge_stack(
+                    luma,
+                    roi,
+                    sigmas,
+                    black_ridges=False,
+                    use_meijering_sato=use_ms,
+                ),
+            )
+        vessel = np.where(spec, 0.0, vessel)
+        if use_tangent:
+            vessel, _tip_lift = _extend_tips_along_tangent(vessel, luma, roi)
+        thresh = _threshold(
+            vessel,
+            roi,
+            weight,
+            percentile=percentile,
+            floor=floor,
+            debug_prefix=None,
+        )
+
+    if save_tip_debug:
+        base = _norm_roi(frangi_only, roi)
+        enh = _norm_roi(vessel, roi)
+        delta = np.maximum(enh - base, 0.0)
+        gain = (enh > base * 1.05) & (enh > 0.05) & roi
+        cv2.imwrite(str(OUT / "02a_vessel_frangi_only.png"), _to_u8(base, roi))
+        cv2.imwrite(str(OUT / "02b_tip_delta.png"), _to_u8(delta, roi))
+        tip_vis = np.zeros((*roi.shape, 3), dtype=np.uint8)
+        tip_vis[roi] = _to_u8(enh, roi)[roi, None].repeat(3, axis=1)
+        tip_vis[gain] = (0, 255, 255)  # cyan = stronger than Frangi-only
+        cv2.imwrite(str(OUT / "02c_tip_lift_overlay.png"), tip_vis)
+        # Frangi-only thresh vs new thresh difference
+        thr_f = _threshold(
+            frangi_only, roi, weight, percentile=percentile, floor=floor
+        )
+        added = thresh & ~thr_f & roi
+        lost = thr_f & ~thresh & roi
+        cmp = np.zeros((*roi.shape, 3), dtype=np.uint8)
+        cmp[roi] = 40
+        cmp[thr_f & thresh] = (200, 200, 200)
+        cmp[added] = (0, 255, 0)  # green = newly recovered
+        cmp[lost] = (0, 0, 255)  # red = lost vs frangi
+        cv2.imwrite(str(OUT / "02d_thresh_delta.png"), cmp)
+        print(
+            f"tip_mode={mode} gain_px={int(gain.sum())} "
+            f"thresh_add={int(added.sum())} thresh_lost={int(lost.sum())}"
+        )
+
     mask = _morph(
         thresh,
         close_ksize=close_ksize,
@@ -428,6 +799,7 @@ def main() -> None:
         close_ksize=CLOSE_KSIZE,
         open_ksize=OPEN_KSIZE,
         min_object_px=MIN_OBJECT_PX,
+        save_tip_debug=True,
     )
     # Dump 03_* sub-steps on coarse vesselness (what becomes 03_thresh)
     _threshold(
@@ -481,8 +853,8 @@ def main() -> None:
     print(f"input:  {rgba_path.relative_to(ROOT)}")
     print(f"output: {OUT.relative_to(ROOT)}")
     print(
-        f"prep={PREP_MODE} skin_w={USE_SKIN_WEIGHT} elong={ELONGATE_FILTER} "
-        f"pct={VESSEL_PERCENTILE} vellus={INCLUDE_VELLUS} "
+        f"prep={PREP_MODE} tip={TIP_MODE} skin_w={USE_SKIN_WEIGHT} "
+        f"elong={ELONGATE_FILTER} pct={VESSEL_PERCENTILE} vellus={INCLUDE_VELLUS} "
         f"raw={int(raw_union.sum())} coarse={int(mask_c.sum())} "
         f"vellus_px={int(mask_v.sum())} union={int(mask.sum())}"
     )
