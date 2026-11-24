@@ -47,7 +47,7 @@ MIN_OBJECT_PX = 0  # 0 = skip remove_small_objects
 # Black-hat parallel path: dark lines without tubular (junction) suppression
 USE_TOPHAT_BRIDGE = True
 TOPHAT_KSIZE = 7  # ellipse; ~hair width + margin
-TOPHAT_PERCENTILE = 94.0  # stricter than Frangi — only strong dark strokes
+TOPHAT_PERCENTILE = 88.0  # 原 94.0(thr=34) 切太狠；靠 TOPHAT_NEAR_PX 控噪
 TOPHAT_FLOOR = 4.0  # absolute blackhat floor (0–255)
 TOPHAT_NEAR_PX = 5  # 0 = global; >0 only keep tophat within dilate(Frangi)
 
@@ -59,11 +59,13 @@ CLOSE_KSIZE_VELLUS = 3
 MIN_OBJECT_PX_VELLUS = 8
 VELLUS_BRIGHT_RIDGES = True  # catch highlight peach-fuzz
 
+# 原始 vessel 绝对下限（0–255，相对 ROI max）。百分位仍在全 ROI 上算，此门只删弱纹理
+VESSEL_ABS_FLOOR = 10.0  # 参考 03a p90≈10；0 = 关闭
 LOCAL_NORM_KSIZE = 31  # 原 101：核太大 → 线旁弱尾被抬满成光晕
 LOCAL_NORM_POWER = 1.35  # >1 压中灰，减轻泛白光晕
 # 压 ROI 黑边假脊：外面填边缘中值再跑 Hessian；scored 再按距边衰减
 ROI_EDGE_FILL = True
-BORDER_DAMP_PX = 14  # dist < 此 → 线性压到 0（贴轮廓假脊）
+BORDER_DAMP_PX = 5  # 仅 Frangi 分支：dist < 此 → 线性压到 0（原 14 太宽，压掉贴边发丝）
 SPECULAR_Y = 220
 SPECULAR_S_MAX = 40
 SKIN_CR = (133, 173)
@@ -490,6 +492,14 @@ def _local_normalize(v: np.ndarray, roi: np.ndarray) -> np.ndarray:
     return np.where(roi, norm.astype(np.float32), 0.0)
 
 
+def _abs_vessel_gate(v: np.ndarray, roi: np.ndarray) -> np.ndarray:
+    """True where raw vessel ≥ VESSEL_ABS_FLOOR (0–255 scale vs ROI max)."""
+    if VESSEL_ABS_FLOOR <= 0 or not np.any(roi):
+        return np.ones(v.shape, dtype=bool)
+    vmax = max(float(v[roi].max()), 1e-8)
+    return (v / vmax * 255.0) >= float(VESSEL_ABS_FLOOR)
+
+
 def _threshold(
     v: np.ndarray,
     roi: np.ndarray,
@@ -507,12 +517,14 @@ def _threshold(
     # 百分位只在未硬切掉的像素上算，避免大量 0 把 thr 拉崩
     eligible = roi & (weight > 0)
     vals = scored[eligible]
+    # 绝对下限：原始 vessel（相对 ROI max，0–255）低于此值不算头发，防止归一化把弱纹理抬过阈值
+    abs_gate = _abs_vessel_gate(v, roi)
     if vals.size == 0:
         binary = np.zeros(v.shape, dtype=bool)
         thr = 0.0
     else:
         thr = max(float(np.percentile(vals, percentile)), floor)
-        binary = (scored >= thr) & eligible
+        binary = (scored >= thr) & eligible & abs_gate
 
     if debug_prefix is not None:
         # 03a: vesselness already in 02; still dump ROI-cleared vessel for chain
@@ -556,21 +568,39 @@ def _tophat_dark_mask(
     ksize: int,
     percentile: float,
     floor: float,
+    debug_prefix: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Black-hat dark strokes (no tubular prior → crossings stay bright)."""
     k = max(3, ksize | 1)
     u8 = np.clip(luma, 0, 255).astype(np.uint8)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     bh = cv2.morphologyEx(u8, cv2.MORPH_BLACKHAT, kernel).astype(np.float32)
-    damp = _border_damp(roi)
-    scored = np.where(roi, bh * weight * damp, 0.0)
+    # 黑帽输入已在 ROI 外用边缘中值填充，无需边界衰减（否则压掉真实贴边发丝）
+    scored = np.where(roi, bh * weight, 0.0)
     scored = np.where(spec, 0.0, scored)
     eligible = roi & (weight > 0) & ~spec
     vals = scored[eligible]
     if vals.size == 0:
-        return bh, np.zeros(roi.shape, dtype=bool)
-    thr = max(float(np.percentile(vals, percentile)), float(floor))
-    binary = (scored >= thr) & eligible
+        binary = np.zeros(roi.shape, dtype=bool)
+        thr = 0.0
+    else:
+        thr = max(float(np.percentile(vals, percentile)), float(floor))
+        binary = (scored >= thr) & eligible
+    if debug_prefix is not None:
+        cv2.imwrite(str(OUT / f"{debug_prefix}_1_bh_raw.png"), _to_u8(bh, roi))
+        cv2.imwrite(str(OUT / f"{debug_prefix}_2_scored.png"), _to_u8(scored, roi))
+        cv2.imwrite(
+            str(OUT / f"{debug_prefix}_3_eligible.png"),
+            (eligible.astype(np.uint8) * 255),
+        )
+        cv2.imwrite(
+            str(OUT / f"{debug_prefix}_4_thresh_before_near.png"),
+            (binary.astype(np.uint8) * 255),
+        )
+        print(
+            f"tophat debug {debug_prefix}: pct={percentile} floor={floor} "
+            f"thr={thr:.3f} pass={int(binary.sum())}/{int(eligible.sum())}"
+        )
     return scored, binary
 
 
@@ -798,6 +828,7 @@ def _branch(
             ksize=TOPHAT_KSIZE,
             percentile=TOPHAT_PERCENTILE,
             floor=TOPHAT_FLOOR,
+            debug_prefix="02e" if save_tip_debug else None,
         )
         if TOPHAT_NEAR_PX > 0:
             k = max(3, int(TOPHAT_NEAR_PX) * 2 + 1)
