@@ -87,16 +87,30 @@ CLAHE_GRID = (8, 8)
 
 ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = ROOT / "sources" / "exclude_crops"
-OUT = Path(__file__).resolve().parent / "output"
+OUT_ROOT = Path(__file__).resolve().parent / "output"
+OUT = OUT_ROOT  # updated per sample in _run_one
 # PS 可选颜色+黑白结果（用户提供）
-EXTERNAL_PREP = OUT / "01_roi_enhancment.png"
+EXTERNAL_PREP = OUT_ROOT / "01_roi_enhancment.png"
 
 
-def _find_rgba() -> Path:
+def _find_all_rgba() -> list[Path]:
     matches = sorted(SRC_DIR.glob("*_exclude_rgba.png"))
     if not matches:
         raise FileNotFoundError(f"No *_exclude_rgba.png under {SRC_DIR}")
-    return matches[0]
+    return matches
+
+
+def _find_rgba() -> Path:
+    return _find_all_rgba()[0]
+
+
+def _sample_name(rgba_path: Path) -> str:
+    """Short folder name like '103964-manual6' from '<id>-<ts>-<manual>-...'."""
+    stem = rgba_path.name.replace("_exclude_rgba.png", "")
+    parts = stem.split("-")
+    if len(parts) >= 3:
+        return f"{parts[0]}-{parts[2]}"
+    return stem
 
 
 def _load_bgr_roi(rgba_path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -867,9 +881,10 @@ def _branch(
     return vessel, thresh, mask, tophat_added
 
 
-def main() -> None:
+def _run_one(rgba_path: Path, out_dir: Path) -> np.ndarray:
+    global OUT
+    OUT = out_dir
     OUT.mkdir(parents=True, exist_ok=True)
-    rgba_path = _find_rgba()
     bgr, roi = _load_bgr_roi(rgba_path)
 
     roi_vis = bgr.copy()
@@ -970,6 +985,120 @@ def main() -> None:
         f"coarse={int(mask_c.sum())} vellus_px={int(mask_v.sum())} "
         f"union={int(mask.sum())} tophat_kept={int((tophat_c & mask_c).sum())}"
     )
+    _save_sample_grid_3x3(OUT)
+    return overlay
+
+
+def _make_grid_3x3(
+    tiles: list[tuple[str, np.ndarray]],
+    out_path: Path,
+    *,
+    cell_w: int = 1200,
+) -> None:
+    """Pack up to 9 (label, img) tiles into a crisp 3x3 PNG without heavy compression."""
+    if not tiles:
+        return
+    # Match cell aspect to the first tile so images aren't distorted
+    h0, w0 = tiles[0][1].shape[:2]
+    cell_h = max(200, int(round(cell_w * h0 / max(w0, 1))))
+    bar_h = 44
+    pad = 8
+    cols, rows = 3, 3
+    canvas = np.full(
+        (rows * (cell_h + bar_h) + (rows + 1) * pad, cols * cell_w + (cols + 1) * pad, 3),
+        18,
+        dtype=np.uint8,
+    )
+    for idx, (label, img) in enumerate(tiles[:9]):
+        r, c = divmod(idx, cols)
+        y0 = pad + r * (cell_h + bar_h + pad)
+        x0 = pad + c * (cell_w + pad)
+        bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR) if img.ndim == 2 else img[:, :, :3]
+        ih, iw = bgr.shape[:2]
+        scale = min(cell_w / max(iw, 1), cell_h / max(ih, 1))
+        nw, nh = max(1, int(round(iw * scale))), max(1, int(round(ih * scale)))
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        resized = cv2.resize(bgr, (nw, nh), interpolation=interp)
+        # Header bar
+        cv2.rectangle(canvas, (x0, y0), (x0 + cell_w, y0 + bar_h), (36, 36, 36), -1)
+        cv2.putText(
+            canvas,
+            label,
+            (x0 + 12, y0 + 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (240, 240, 240),
+            2,
+            cv2.LINE_AA,
+        )
+        # Center image inside cell
+        ox = x0 + (cell_w - nw) // 2
+        oy = y0 + bar_h + (cell_h - nh) // 2
+        canvas[oy : oy + nh, ox : ox + nw] = resized
+    cv2.imwrite(str(out_path), canvas, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+
+
+def _save_sample_grid_3x3(out_dir: Path) -> None:
+    stage_files = [
+        ("1. 01_roi", "01_roi.png"),
+        ("2. 01b_frangi_in", "01b_frangi_input.png"),
+        ("3. 02_vesselness", "02_vesselness.png"),
+        ("4. 02e_tophat", "02e_tophat.png"),
+        ("5. 02f_tophat_bin", "02f_tophat_binary.png"),
+        ("6. 03d_scored", "03d_scored.png"),
+        ("7. 03_thresh", "03_thresh.png"),
+        ("8. 04_mask", "04_mask.png"),
+        ("9. 05_overlay", "05_overlay.png"),
+    ]
+    tiles: list[tuple[str, np.ndarray]] = []
+    for label, fname in stage_files:
+        im = cv2.imread(str(out_dir / fname), cv2.IMREAD_UNCHANGED)
+        if im is not None:
+            tiles.append((label, im))
+    if tiles:
+        _make_grid_3x3(tiles, out_dir / "00_grid_3x3.png", cell_w=1200)
+
+
+def _save_per_step_grids(
+    sample_dirs: list[tuple[str, Path]],
+    out_root: Path,
+    *,
+    cell_w: int = 1200,
+) -> list[str]:
+    """For every step PNG produced in per-sample folders, stitch a 3x3 grid at out_root."""
+    step_names: set[str] = set()
+    for _, d in sample_dirs:
+        for f in d.glob("*.png"):
+            if f.name != "00_grid_3x3.png":
+                step_names.add(f.name)
+    written: list[str] = []
+    for fname in sorted(step_names):
+        tiles: list[tuple[str, np.ndarray]] = []
+        for idx, (name, d) in enumerate(sample_dirs, 1):
+            p = d / fname
+            if not p.is_file():
+                continue
+            im = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+            if im is not None:
+                tiles.append((f"{idx}. {name}", im))
+        if tiles:
+            _make_grid_3x3(tiles, out_root / fname, cell_w=cell_w)
+            written.append(fname)
+    return written
+
+
+def main() -> None:
+    paths = _find_all_rgba()
+    print(f"Batch running {len(paths)} samples → {OUT_ROOT.relative_to(ROOT)}/<sample>/")
+    sample_dirs: list[tuple[str, Path]] = []
+    for idx, p in enumerate(paths, 1):
+        name = _sample_name(p)
+        print(f"\n[{idx}/{len(paths)}] === {name} ===")
+        out_dir = OUT_ROOT / name
+        _run_one(p, out_dir)
+        sample_dirs.append((name, out_dir))
+    written = _save_per_step_grids(sample_dirs, OUT_ROOT, cell_w=1200)
+    print(f"\nSaved {len(written)} per-step 3x3 grids → {OUT_ROOT.relative_to(ROOT)}/")
 
 
 if __name__ == "__main__":

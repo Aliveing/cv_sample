@@ -1,0 +1,25 @@
+---
+description: Git Commit Message Guidelines
+alwaysApply: false
+priority: highest
+---
+
+### headers  
+Message must start with following headers  
+
+- **[Release]**: Major feature (e.g. project completion); use for the final commit when pushing to the main server. 
+- **[Developing]**: Work in progress. Use when a Feat is not yet complete. Commits for temporary code storage. 
+- **[Feat]**: Feature   
+- **[Chore]**: Routine maintenance tasks or trivial work that does not directly affect the functionality of the code.
+- **[Refactor]**: Code refactoring (code cleanup).   
+- **[UI]**: User interface. 
+- **[Bugfix]**: Bug fix. Use for fixes made after a Feat.   
+- **[Hotfix]**: Hotfix; for urgent changes when a detailed commit message is omitted. 
+- **[Docs]**: Documentation (e.g. dev docs, comments).   
+- **[I18n]**: Use for translation.  
+
+### description  
+after header and title, you should write description in Chinese with list format. description must be specific and detailed. 
+
+### example  
+[Bugfix] 修复审批流审批状态显示问题
